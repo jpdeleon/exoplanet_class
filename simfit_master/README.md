@@ -1,0 +1,2 @@
+# simfit
+(simple) simultaneous fitting

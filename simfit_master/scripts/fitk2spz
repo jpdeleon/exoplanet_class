@@ -1,0 +1,936 @@
+#!/usr/bin/env python
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as pl
+
+import os
+import sys
+import yaml
+import numpy as np
+np.warnings.simplefilter('ignore')
+import pandas as pd
+import scipy.optimize as op
+from multiprocessing import cpu_count
+
+import simfit
+from simfit.io import DataSet, SpzDataSet
+from simfit.prior import PriorSet
+from simfit.prior import GaussianPrior
+from simfit.prior import UniformPrior
+from simfit.like import LnLikeK2
+from simfit import lnprob, lnprior, lnlike, Fit
+
+from simfit.like import LnLikeSpz
+
+from astropy.stats import sigma_clip
+import seaborn as sb
+import statsmodels.api as sm
+
+from emcee import MHSampler, EnsembleSampler, PTSampler
+from emcee.utils import sample_ball
+import corner
+
+import pickle
+from everest import Everest
+
+import argparse
+from tqdm import tqdm
+import time
+
+import limbdark
+import sxp
+
+
+cwd = os.path.abspath('.')
+parser = argparse.ArgumentParser(description="Retrieve K2 light curve"
+                                 " from Everest and fit individual transits")
+parser.add_argument('-i', '--input', help='path to input YAML file',
+                    type=str, default=os.path.join(cwd, 'input.yaml'))
+parser.add_argument('-o', '--outdir', type=str, default='.')
+parser.add_argument('--clobber', dest='clobber', action='store_true')
+parser.add_argument('--clip', dest='clip', action='store_true')
+parser.add_argument('--k2only', dest='k2only', action='store_true')
+parser.add_argument('--restart', dest='restart', action='store_true')
+parser.add_argument('--nthreads', type=int, default=1,
+                    help='number of threads (processes) to use for MCMC')
+parser.add_argument('--nsteps', type=int, default=5000,
+                    help='total number of MCMC steps')
+parser.add_argument('--burn', type=int, default=2000,
+                    help='number of MCMC burn-in steps')
+parser.add_argument('--binsize', type=int, default=600,
+                    help='bin size [seconds] for Spitzer plots')
+parser.add_argument('--ptmcmc', dest='ptmcmc', action='store_true')
+parser.add_argument('--nsteps_pt', type=int, default=1000,
+                    help='number of PT-MCMC initialization steps')
+parser.add_argument('--skip_epochs', type=str, default=None,
+                    help='K2 transit epoch numbers to ignore, comma-separated')
+
+parser.set_defaults(clobber=False, ptmcmc=False,
+                    clip=False, k2only=False, restart=False)
+args = parser.parse_args()
+
+
+# GLOBAL CONFIG
+
+K2_TIME_OFFSET = 2454833
+home = os.environ['HOME']
+setup = simfit.util.parse_setup(args.input)
+epic = setup['config']['star'].split('-')[-1]
+planet = setup['config']['planet']
+if args.skip_epochs:
+    skip_epochs = [int(i) for i in args.skip_epochs.split(',')]
+else:
+    skip_epochs = []
+
+# TODO: fix this ugly hack for data location and upgrade sxp format!
+DATA_DIR_OVERRIDE = os.path.join(home, 'data', 'spitzer', 'phot_out', 'pickles')
+
+if 'epoch' in setup['config'].keys():
+    epoch = setup['config']['epoch']
+    outdirname = 'EPIC-{}{}_e{}'.format(epic, planet, epoch)
+else:
+    outdirname = 'EPIC-{}{}'.format(epic, planet)
+
+if not args.k2only:
+    outdirname += '_spz'
+
+outdir = os.path.join(args.outdir, outdirname)
+# chaindir = os.path.join(home, 'data', 'chains', outdirname)
+chaindir = outdir
+
+try:
+    os.mkdir(args.outdir)
+except:
+    pass
+
+try:
+    os.mkdir(outdir)
+except:
+    if not args.clobber:
+        raise IOError("Output directory exists and clobber set to False")
+
+if not os.path.isdir(chaindir):
+    os.mkdir(chaindir)
+
+yaml.dump(setup, open(os.path.join(outdir, 'input.yaml'), 'w'))
+
+# TRANSIT PARAMS
+
+tr = setup['transit']
+if tr['i'] > np.pi/2.:
+    tr['i'] = np.pi - tr['i']
+for k,v in tr.items():
+    print "{} = {}".format(k,v)
+
+
+# GET K2 LIGHT CURVE
+
+star = Everest(int(epic))
+# TODO: mask out transits and recompute (see EVEREST documentation)
+with sb.axes_style('white'):
+    star.plot()
+    pl.savefig(os.path.join(outdir, 'everest_plot.png'))
+    pl.close()
+
+
+# EXTRACT INDIVIDUAL TRANSITS
+
+transits = simfit.util.extract_individual(star, tr['p'], tr['t0'] - K2_TIME_OFFSET)
+while np.max(transits[0][0]) < tr['t0'] - K2_TIME_OFFSET:
+    print "Tc is before T0 -- skipping"
+    transits = transits[1:]
+
+
+# LIMB DARKENING
+
+
+teff = setup['stellar']['teff']
+logg = setup['stellar']['logg']
+teff_mult, logg_mult = 1, 1
+u_kep, u_spz = np.repeat(np.nan, 4), np.repeat(np.nan, 4)
+while np.isnan(u_kep).any() | np.isnan(u_spz).any():
+
+    teff_mult += 1
+    logg_mult += 1
+
+    u_kep[:] = limbdark.get_ld('Kp', teff[0], teff_mult*teff[1], logg[0], logg_mult*logg[1])
+    # u_kep[:] = [float(i) for i in u_kep]
+
+    u_spz[:] = limbdark.get_ld('S2', teff[0], teff_mult*teff[1], logg[0], logg_mult*logg[1])
+    # u_spz[:] = [float(i) for i in u_spz]
+
+u_kep = u_kep.tolist()
+u_spz = u_spz.tolist()
+print "teff uncertainty multiplier needed: {}".format(teff_mult)
+print "logg uncertainty multiplier needed: {}".format(logg_mult)
+print "Kepler u1: {0:.4f}+/-{1:.4f}, u2: {2:.4f}+/-{3:.4f}".format(*u_kep)
+print "Spitzer u1: {0:.4f}+/-{1:.4f}, u2: {2:.4f}+/-{3:.4f}".format(*u_spz)
+
+df = limbdark.get_ld_df('Kp', teff[0], teff_mult*teff[1], logg[0], logg_mult*logg[1])
+for key in "teff logg feh".split():
+    print "{} range: {} - {}".format(key, df[key].min(), df[key].max())
+
+
+# CREATE DATASETS AND PRIORS
+
+fit = Fit()
+
+# K2
+
+epochs = range(len(transits))
+if args.skip_epochs:
+    for i in sorted(skip_epochs, reverse=True):
+        epochs.pop(i)
+        transits.pop(i)
+clip = args.clip
+siglo, sighi = 10, 2
+tc_prior_width = 1.0
+
+for i,transit in enumerate(transits):
+
+    t, f = map(np.array, transit)
+    t += K2_TIME_OFFSET
+    f /= np.nanmedian(f)
+
+    if clip:
+        # TODO: mask out the transit first, then can use more agressive clipping
+        fm = sigma_clip(f, sigma_lower=siglo, sigma_upper=sighi)
+        t, f = t[~fm.mask], f[~fm.mask]
+        print "{} flux outliers clipped".format(fm.mask.sum())
+
+    epoch = epochs[i]
+    name = 'k2-e{}'.format(epoch)
+
+    print "creating dataset: {}".format(name)
+    ds = DataSet(name, t, f)
+
+    print "creating priorset: {}".format(name)
+    ps = PriorSet(name)
+
+
+    # shared gaussian priors
+
+    gaussianpriors = dict(u1_k2=(u_kep[0], u_kep[1]*2),
+                          u2_k2=(u_kep[2], u_kep[3]*2))
+
+    for k,v in gaussianpriors.items():
+        ps[k] = GaussianPrior(k, *v)
+
+
+    # shared uniform priors
+
+    uniformpriors = dict(a=(0, tr['a']*2),
+                         k=(0, 1),
+                         i=(0, np.pi/2),
+                         sig=(0, 1))
+
+    for k,v in uniformpriors.items():
+        ps[k] = UniformPrior(k, *v)
+
+
+    # separate uniform priors for baseline functions
+
+    uniformpriors = dict(cm=(-np.inf, np.inf),
+                         cb=(-np.inf, np.inf))
+
+    for k,v in uniformpriors.items():
+        key = k+'_{}'.format(epoch)
+        ps[key] = UniformPrior(key, *v)
+
+
+    # separate uniform priors for Tc values
+
+    tc = tr['t0'] + epoch * tr['p']
+    print tc
+    key = 'tc_{}'.format(epoch)
+    ps[key] = UniformPrior(key, tc - tc_prior_width/2., tc + tc_prior_width/2.)
+
+    fit.add_data(ds)
+    fit.add_priorsets(ps)
+    fit.add_lnlikes(LnLikeK2(name, fixed=dict(p=tr['p']), bl=True, tc=tc))
+
+
+# SPITZER
+
+if not args.k2only:
+
+    fps = [args.input]
+    spz_epochs = []
+
+    for i,fp in enumerate(fps):
+
+        setup = yaml.load(open(fp))
+        setup['config']['data_dir'] = DATA_DIR_OVERRIDE
+        # TODO: this will change when sxp output gets upgraded
+        ds_spz = sxp.SxpDataset(setup)
+
+        epoch = 0
+        tc = np.array(tr['t0'], copy=True)
+        while tc < ds_spz['t'].min():
+            tc += tr['p']
+            epoch += 1
+        spz_epochs.append(epoch)
+
+    for i,fp in enumerate(fps):
+
+        setup = yaml.load(open(fp))
+        setup['config']['data_dir'] = DATA_DIR_OVERRIDE
+        # TODO: this will change when sxp output gets upgraded
+        ds_spz = sxp.SxpDataset(setup)
+
+        epoch = spz_epochs[i]
+        name = 'spz-e{}'.format(epoch)
+
+        print "creating dataset: {}".format(name)
+        ds = SpzDataSet(name, *[ds_spz[k] for k in 't,f,pix,s'.split(',')])
+
+        print "creating priorset: {}".format(name)
+        ps = PriorSet(name)
+
+
+        # shared gaussian priors
+
+        gaussianpriors = dict(u1_spz=(u_spz[0], u_spz[1]*2),
+                              u2_spz=(u_spz[2], u_spz[3]*2))
+
+        for k,v in gaussianpriors.items():
+            ps[k] = GaussianPrior(k, *v)
+
+
+        # shared uniform priors
+
+        uniformpriors = dict(a=(0, tr['a']*2),
+                             k=(0, 1),
+                             i=(0, np.pi/2))
+
+        for k,v in uniformpriors.items():
+            ps[k] = UniformPrior(k, *v)
+
+
+        # separate uniform priors
+
+        uniformpriors = dict(cm=(-np.inf, np.inf),
+                             cb=(-np.inf, np.inf))
+
+        for j in range(1,10):
+            uniformpriors['c{}'.format(j)] = (-np.inf, np.inf)
+
+        for k,v in uniformpriors.items():
+            key = k+'_{}'.format(epoch)
+            ps[key] = UniformPrior(key, *v)
+
+
+        # separate uniform Tc priors
+
+        tc = tr['t0'] + epoch * tr['p']
+        print tc
+        key = 'tc_{}'.format(epoch)
+        # ps[key] = UniformPrior(key, tc - tc_prior_width/2., tc + tc_prior_width/2.)
+        ps[key] = UniformPrior(key, ds['t'].min(), ds['t'].max())
+
+        fit.add_data(ds)
+        fit.add_priorsets(ps)
+        fit.add_lnlikes(LnLikeSpz(name, unc=True, fixed=dict(p=tr['p']), tc=tc))
+
+
+    epochs += spz_epochs
+
+
+
+# SAVE PRIORS
+
+priors = {k1:{k2:(dict(kind=v2.kind, mu=v2.mu, sigma=v2.sigma) \
+    if v2.kind is 'Gaussian' else dict(kind=v2.kind, a=v2.a, b=v2.b)) \
+    for k2,v2 in v1.items()} for k1,v1 in fit.priorsets.items()}
+# print yaml.dump(priors)
+fp = os.path.join(outdir, 'priors.yaml')
+yaml.dump(priors, open(fp, 'w'))
+
+
+# PLOT INDIVIDUAL DATASETS
+
+dsnames = sorted(fit.datasets.keys())
+nds = len(dsnames)
+with sb.axes_style('white'):
+    ncol = 2
+    nrow = nds/2
+    nbot = 2
+    if nds % 2 > 0:
+        nrow += 1
+        nbot -= 1
+    fig, axs = pl.subplots(nrow, ncol, figsize=(12,nds),
+                           sharey=True)
+    for i,n in enumerate(dsnames):
+        t, f = fit.datasets[n]['t'], fit.datasets[n]['f']
+        axs.flat[i].plot(t, f, 'k.')
+        axs.flat[i].set_title(n)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'datasets.png'))
+    pl.close()
+
+
+# CREATE INITIAL PARAMETER VECTOR
+
+key = sorted(fit.datasets.keys())[0]
+d = dict(k=tr['k'],
+         a=tr['a'],
+         i=tr['i'],
+         sig=fit.datasets[key]['f'].std(),
+         u1_k2=fit.priorsets[key]['u1_k2'].mu,
+         u2_k2=fit.priorsets[key]['u2_k2'].mu)
+
+if not args.k2only:
+    d['u1_spz']=fit.priorsets['spz-e{}'.format(spz_epochs[0])]['u1_spz'].mu
+    d['u2_spz']=fit.priorsets['spz-e{}'.format(spz_epochs[0])]['u2_spz'].mu
+    for spz_epoch in spz_epochs:
+        for i in range(1, 10):
+            key = 'c{}'.format(i)
+            d[key+'_{}'.format(spz_epoch)] = 0
+
+for epoch in epochs:
+    key = 'cm_{}'.format(epoch)
+    d[key] = 0
+    key = 'cb_{}'.format(epoch)
+    d[key] = 1
+    key = 'tc_{}'.format(epoch)
+    d[key] = tr['t0'] + epoch * tr['p']
+
+initial = [d.get(i) for i in fit.param_names]
+assert d == fit._d(initial)
+
+
+# TRY 1ST PASS OPTIMIZATION WITH NELDER-MEAD
+
+if args.restart:
+    nlp = lambda *args: -lnprob(*args)
+    opt = op.minimize(nlp, initial, args=(fit), method='nelder-mead')
+    print opt.success
+    for i in zip(fit.param_names, opt.x):
+        print "{}\t{}".format(*i)
+    if opt.success:
+        initial = opt.x
+
+
+# PLOT INITIAL FIT
+
+dsnames = sorted([key for key in fit.datasets.keys() if 'k2' in key])
+
+with sb.axes_style('white'):
+    nds = len(dsnames)
+    if nds == 1:
+        # this should never happen, but anyway...
+        fig, axs = pl.subplots(1, nds, figsize=(5,5),
+            sharex=True, sharey=True)
+        fig = [fig] # hacky
+    else:
+        ncol = 2
+        nrow = nds/2
+        nbot = 2
+        if nds % 2 > 0:
+            nrow += 1
+            nbot -= 1
+        fig, axs = pl.subplots(nrow, ncol, figsize=(12,nds),
+            sharex=True, sharey=True)
+    for j,dsname in enumerate(dsnames):
+        ds = fit.datasets[dsname]
+        t, f = ds['t'], ds['f']
+        loglikelihood = fit.lnlikes[ds.name]
+        tm = np.linspace(t.min(), t.max(), 500)
+        d = fit._d(initial, dsname)
+        p = loglikelihood.fixed['p']
+        a,k,i = [d.get(z) for z in 'a,k,i'.split(',')]
+        key = filter(lambda x: 'tc' in x, d.keys())[0]
+        tc = d[key]
+        tdur = simfit.util.tdur_circ(p,a,k,i) * 24
+        model = loglikelihood(d, tm, f, get_model=True)
+        print "T14 [hours]: {}".format(tdur)
+
+        axs.flat[j].plot((t-tc)*24, f, 'ko', ms=10, alpha=1)
+        axs.flat[j].plot((tm-tc)*24, model, color="#4682b4", alpha=1, lw=2.5)
+        axs.flat[j].set_xlabel('Time from mid-transit [hours]', fontsize=16)
+        axs.flat[j].set_ylabel('Normalized flux', fontsize=16)
+        axs.flat[j].set_xlim(-1.5*tdur, 1.5*tdur)
+        axs.flat[j].set_title(dsname)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'initial.png'))
+    pl.close()
+
+
+# BEGIN MCMC
+
+opts = {}
+
+
+if args.ptmcmc:
+
+    # INITIAL EXPLORATION OF PARAMETER SPACE WITH PARALLEL TEMPERED MCMC
+
+    ndim = len(initial)
+    ntemps = 10
+    nwalkers = 4*ndim
+    nsteps = args.nsteps_pt
+
+    sampler1 = PTSampler(ntemps, nwalkers, ndim, lnlike, lnprior,
+                        loglargs=(fit,), logpargs=(fit,), threads=1)
+
+    pos0 = np.array([sample_ball(initial, [1e-5]*ndim, nwalkers) for i in range(ntemps)])
+    assert pos0.shape == (ntemps, nwalkers, ndim)
+
+    tick = time.time()
+
+    for pos,lnp,lnl in tqdm(sampler1.sample(pos0, iterations=nsteps)):
+        pass
+
+    with open(os.path.join(outdir, 'sampler-stats-pt.txt'), 'w') as w:
+        text = "{} steps by {} walkers at {} temperatures took {} seconds\n"
+        text = text.format(nsteps, nwalkers, ntemps, time.time() - tick)
+        w.write(text)
+        print text
+        acceptance = sampler1.acceptance_fraction.mean()
+        text = "mean acceptance rate: {}\n".format(acceptance)
+        w.write(text)
+        print text
+
+    fp = os.path.join(outdir, 'samples-pt.npz')
+    simfit.util.save_samples(fit, sampler1, fp)
+
+
+    # PLOT TRACE
+
+    temp = 0
+    labels = fit.param_names
+    chain = sampler1.chain.copy()
+    with sb.axes_style('white'):
+        fig, axs = pl.subplots(ndim, 1, figsize=(10,20), sharex=True)
+        [axs.flat[i].plot(chain[:,:,temp], drawstyle='steps', color='k', alpha=0.1) for i,chain in enumerate(chain.T)]
+        [pl.setp(axs.flat[i], ylabel=labels[i]) for i in range(ndim)]
+        fig.savefig(os.path.join(outdir, 'trace-pt.png'))
+        pl.close()
+
+
+    # SAVE MAXIMUM POSTERIOR PROBABILITY POSITION
+
+    maxlnp = np.nanmax(sampler1.lnprobability)
+    idx = sampler1.lnprobability == maxlnp
+    opt = sampler1.chain[idx]
+    if opt.shape[0] > 1:
+        opt = opt[0]
+    elif opt.shape[0] == 1:
+        opt = opt.flatten()
+
+    opts['pt'] = dict(maxlnp=float(maxlnp), opt=opt.tolist(), names=fit.param_names)
+    print "max prob PT: {}".format(maxlnp)
+
+
+# RUN THE ENSEMBLE SAMPLER
+
+ndim = len(initial)
+nwalkers = 4*ndim
+nsteps = args.nsteps
+burn = 250
+
+sampler2 = EnsembleSampler(nwalkers, ndim, lnprob, args=[fit], threads=args.nthreads)
+
+if args.ptmcmc:
+    pos0 = pos[0]
+else:
+    pos0 = sample_ball(initial, [1e-3]*ndim, nwalkers)
+
+if not os.path.isfile(os.path.join(chaindir, "chain.dat")) or args.restart:
+
+    thin = 1
+    print "running 1st burn-in"
+    for i,(pos,_,_) in tqdm(enumerate(sampler2.sample(pos0, iterations=burn,
+                                      storechain=True, thin=thin))):
+        pass
+    maxlnp = np.nanmax(sampler2.lnprobability)
+    print "max prob: {}".format(maxlnp)
+    idx = sampler2.lnprobability == maxlnp
+    opt = sampler2.chain[idx]
+    if len(opt.shape) > 1:
+        opt = opt[0]
+    labels = fit.param_names
+    chain = sampler2.chain
+    with sb.axes_style('white'):
+        fig, axs = pl.subplots(ndim, 1, figsize=(10,ndim/2), sharex=True)
+        [axs.flat[i].plot(c, drawstyle='steps', color='k', alpha=4./nwalkers) for i,c in enumerate(chain.T)]
+        [pl.setp(axs.flat[i], ylabel=labels[i], yticks=[]) for i,c in enumerate(chain.T)]
+        fig.savefig(os.path.join(outdir, 'trace-burnin1.png'))
+        pl.close()
+
+    print "running 2nd burn-in"
+    pos0 = sample_ball(opt, [1e-6]*ndim, nwalkers)
+    sampler2.reset()
+    for i,(pos,_,_) in tqdm(enumerate(sampler2.sample(pos0, iterations=burn,
+                                      storechain=True, thin=thin))):
+        pass
+    if sampler2.lnprobability.max() > maxlnp:
+        maxlnp = np.nanmax(sampler2.lnprobability)
+        print "max prob: {}".format(maxlnp)
+        idx = sampler2.lnprobability == maxlnp
+        opt = sampler2.chain[idx]
+        if len(opt.shape) > 1:
+            opt = opt[0]
+        pos0 = sample_ball(opt, [1e-6]*ndim, nwalkers)
+    else:
+        pos0 = pos
+    chain = sampler2.chain
+    with sb.axes_style('white'):
+        fig, axs = pl.subplots(ndim, 1, figsize=(10,ndim/2), sharex=True)
+        [axs.flat[i].plot(c, drawstyle='steps', color='k', alpha=4./nwalkers) for i,c in enumerate(chain.T)]
+        [pl.setp(axs.flat[i], ylabel=labels[i], yticks=[]) for i,c in enumerate(chain.T)]
+        fig.savefig(os.path.join(outdir, 'trace-burnin2.png'))
+        pl.close()
+
+    print "running production"
+    tick = time.time()
+    fp = os.path.join(chaindir, "chain.dat")
+    f = open(fp, "w")
+    f.close()
+    f = open(os.path.join(chaindir, "chain.dat"), "a")
+    pos0 = pos
+    sampler2.reset()
+    for i,(pos,_,_) in tqdm(enumerate(sampler2.sample(pos0, iterations=nsteps,
+                                      storechain=True, thin=thin))):
+        for k in range(pos.shape[0]):
+            f.write("{0} {1}\n".format(i, " ".join([str(j) for j in pos[k]])))
+    f.close()
+
+    with open(os.path.join(outdir, 'sampler-stats.txt'), 'w') as w:
+        text = "{} steps by {} walkers took {} seconds\n"
+        text = text.format(nsteps, nwalkers, time.time() - tick)
+        w.write(text)
+        print text
+        acceptance = sampler2.acceptance_fraction.mean()
+        acor = sampler2.acor.mean()
+        text = "mean acceptance rate: {}\n".format(acceptance)
+        w.write(text)
+        print text
+        text = "mean autocorrelation time: {}".format(acor)
+        w.write(text)
+        print text
+
+else:
+
+    print "using previously computed chain. if this isn't what you wanted, " +\
+        "use --restart"
+
+
+# LOAD CHAIN
+
+fp = os.path.join(chaindir, "chain.dat")
+df = pd.read_table(fp, sep=' ', index_col=0, header=None)
+chain = np.zeros((nwalkers, nsteps, ndim))
+for step,pos in df.groupby(df.index):
+    chain[:,step,:] = pos.values
+
+
+# PLOT TRACE
+
+labels = fit.param_names
+with sb.axes_style('white'):
+    fig, axs = pl.subplots(ndim, 1, figsize=(10,ndim/2), sharex=True)
+    [axs.flat[i].plot(c, drawstyle='steps', color='k', alpha=4./nwalkers) for i,c in enumerate(chain.T)]
+    [pl.setp(axs.flat[i], ylabel=labels[i], yticks=[]) for i,c in enumerate(chain.T)]
+    fig.savefig(os.path.join(outdir, 'trace-production1.png'))
+    pl.close()
+
+
+# SAVE MAXIMUM POSTERIOR PROBABILITY POSITION
+
+try:
+
+    if sampler2.lnprobability.max() > maxlnp:
+        maxlnp = np.nanmax(sampler2.lnprobability)
+        idx = sampler2.lnprobability == maxlnp
+        opt = sampler2.chain[idx]
+        if len(opt.shape) > 1:
+            opt = opt[0]
+
+    opts['es'] = dict(maxlnp=float(maxlnp), opt=opt.tolist(), names=fit.param_names)
+    print "max prob: {}".format(maxlnp)
+
+    fp = os.path.join(outdir, 'opt.yaml')
+    yaml.dump(opts, open(fp, 'w'))
+
+except:
+
+    try:
+
+        fp = os.path.join(outdir, 'opt.yaml')
+        opts = yaml.load(open(fp, 'r'))
+        idx = np.argmax([opts[k]['maxlnp'] for k in opts])
+        opt = [opt['opt'] for opt in opts.values()][idx]
+
+    except:
+
+        raise IOError("Required file for --no-restart opt.yaml not found.")
+
+
+# CREATE FLAT CHAIN
+
+burn = args.burn
+thin = 1
+fc = chain[:,burn::thin,:].reshape(-1, ndim)
+
+
+# PLOT K2 FITS
+
+simfit.plot.k2(fit, fc, save=os.path.join(outdir, 'fits-k2.png'))
+
+
+# TRANSIT PARAMETER CORNER PLOT
+
+params = ['a', 'i', 'k', 'sig']
+idx = [fit.param_names.index(p) for p in params]
+labels = ['${}$'.format(i) for i in 'a i k \sigma'.split()]
+
+with sb.axes_style('white'):
+    fig, axs = pl.subplots(len(idx), len(idx), figsize=(8,8))
+    corner.corner(fc[:,idx], fig=fig, labels=labels, #truths=opt[idx],
+                  hist_kwargs=dict(lw=2, alpha=0.5),
+                  title_kwargs=dict(fontdict=dict(fontsize=12)),
+                  show_titles=True, quantiles=[0.16,0.5,0.84],
+                  title_fmt='.4f')
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'corner.png'))
+    pl.close()
+
+
+# PLOT TC POSTERIORS
+
+params = ['tc_{}'.format(i) for i in epochs]
+idx = [fit.param_names.index(p) for p in params]
+labels = ['$T_({})$'.format(i).replace('(','{').replace(')','}') for i in epochs]
+ntc = len(idx)
+ncol = ntc if ntc < 4 else 4
+nrow = ntc/ncol
+if ntc % ncol > 0:
+    nrow += 1
+Tc0 = np.percentile(fc[:,idx[0]], 50, axis=0)
+with sb.axes_style('white'):
+    fig, axs = pl.subplots(nrow, ncol, figsize=(13,2*ntc/3.))
+    for j in range(ntc):
+        tc = fc[:,idx[j]]-Tc0
+        axs.flat[j].hist(tc, bins=20, histtype='step', lw=3)
+        pc = np.percentile(tc,[16,50,84])
+        axs.flat[j].vlines(pc, *axs.flat[j].get_ylim(), linestyles='--')
+        pl.setp(axs.flat[j], xticks=[], yticks=[])
+        label = labels[j]
+        title = '$({0:.4f})^(+{1:.4f})_(-{2:.4f})$'.format(pc[1], pc[2]-pc[1], pc[1]-pc[0])
+        title = label + ' = ' + title
+        axs.flat[j].set_title(title.replace('(','{').replace(')','}'), fontsize=16)
+        fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'tc-hist.png'))
+    pl.close()
+
+
+# PLOT T14
+
+t14 = simfit.plot.t14(fit, fc, save=os.path.join(outdir, 't14.png'))
+# t14 = simfit.plot.t14(fit, fc, save=os.path.join(outdir, 't14.eps'))
+
+
+# EXTRACT PARAMETERS
+
+sigma = zip(*np.percentile(fc, (16, 84), axis=0))
+mu = np.percentile(fc, 50, axis=0)
+idx = np.argmax([opts[k]['maxlnp'] for k in opts])
+opt = [opt['opt'] for opt in opts.values()][idx]
+params = fit.param_names
+names_internal = list('kai') + ['tc_{}'.format(e) for e in epochs]
+
+vals_median = {}
+vals_maxlnp = {}
+for ni in names_internal:
+    val = mu[params.index(ni)]
+    sig = sigma[params.index(ni)]
+    vals_median[ni] = dict(mu=val, lo=sig[0], hi=sig[1])
+    val = opt[params.index(ni)]
+    vals_maxlnp[ni] = dict(mu=val, lo=sig[0], hi=sig[1])
+
+
+# STELLAR DENSITY AND LOGG
+
+from simfit.util import logg, rho
+
+assert 4.64 == logg(rho(4.64, 0.6), 0.6)
+print "log(g) for M0 = 4.64"
+a = vals_median['a']['mu']
+p = fit.lnlikes.values()[0].fixed['p']
+rstar = setup['stellar']['rstar'][0]
+print "log(g) (assuming circular orbit, Rs={}) = {}".format(rstar, logg(simfit.util.rhostar(p, a), rstar))
+print "stellar density for M0 = {}".format(rho(4.64, 0.6))
+print "stellar density (assuming circular orbit) = {}".format(simfit.util.rhostar(p, a))
+print "max prob: {}".format(simfit.util.rhostar(p, vals_maxlnp['a']['mu']))
+print "median:".format(simfit.util.rhostar(p, vals_median['a']['mu']))
+rhomin = simfit.util.rhostar(p, vals_median['a']['lo'])
+rhomax = simfit.util.rhostar(p, vals_median['a']['hi'])
+print "1-sigma range: {} - {}".format(rhomin, rhomax)
+
+
+# MAKE LATEX TABLE
+
+names_internal = list('kai') + ['tc_{}'.format(e) for e in epochs]
+names_good = ["R_p/R_*", "a/R_*", "i"]
+names_good += ["T_[c,{}]".format(e).replace('[','{').replace(']', '}') for e in epochs]
+units = ["", "", "(degrees)"] + ["($BJD_{TDB}$)"] * len(epochs)
+
+with open(os.path.join(outdir, 'table.tex'), 'w') as f:
+    for ng, ni, un in zip(names_good, names_internal, units):
+        vals = vals_median[ni]
+        val = vals['mu']
+        upper = vals['hi'] - val
+        lower = val - vals['lo']
+        text = "${0}$ {1} & ${2:.5f}^[+{3:.5f}]_[-{4:.5f}]$ \\\\"
+        if ni == 'i':
+            val, upper, lower = map(lambda x: x*180/np.pi, [val, upper, lower])
+        text = text.format(ng, un, val, upper, lower)
+        text = text.replace('[','{').replace(']', '}')
+        text = text.replace('(','[').replace(')',']')
+        f.write(text + '\n')
+
+
+# FIT LINEAR EPHEMERIS
+
+m_ls, m_sig, b_ls, b_sig = simfit.util.fit_linear_ephem(*simfit.util.get_ephem(vals_maxlnp, epochs))
+print "max prob P [days] = {} +/- {}".format(m_ls, m_sig)
+
+m_ls, m_sig, b_ls, b_sig = simfit.util.fit_linear_ephem(*simfit.util.get_ephem(vals_median, epochs))
+print "median P [days] = {} +/- {}".format(m_ls, m_sig)
+
+
+# MORE PLOTS
+
+simfit.plot.ephem(vals_median, epochs, save=os.path.join(outdir, 'ephem.png'))
+simfit.plot.oc(vals_median, epochs, save=os.path.join(outdir, 'oc.png'))
+fp = os.path.join(outdir, 'ephem-post.png')
+simfit.plot.ephem_posteriors(fit, fc, epochs, save=fp)
+
+rho = simfit.util.sample_rhostar(fit, fc, epochs)
+p0 = 1,rho.mean(),rho.std(), 1,np.median(rho),rho.std()
+simfit.plot.multi_gauss_fit(rho, p0)
+pl.xlabel(r'$\rho_{\star,circ}\ [g/cm^3]$', fontsize=24)
+pl.tight_layout()
+pl.savefig(os.path.join(outdir, 'rhostar.png'))
+pl.close()
+
+rstar, urstar = setup['stellar']['rstar']
+lg = simfit.util.sample_logg(rho, rstar, urstar)
+p0 = 1,lg.mean(),lg.std(), 1,np.median(lg),lg.std()
+simfit.plot.multi_gauss_fit(lg, p0)
+pl.xlabel(r'$log\ g$', fontsize=24)
+pl.tight_layout()
+pl.savefig(os.path.join(outdir, 'logg.png'))
+pl.close()
+
+
+# PLOT AND SAVE PHASE FOLDED LIGHTCURVE
+
+tcnames = sorted([key for key in fit.param_names if key.startswith('tc')])
+idx = [fit.param_names.index(i) for i in tcnames]
+tcs = np.median(fc[:,idx], axis=0)
+dsnames = sorted([key for key in fit.datasets.keys() if key.startswith('k2')])
+tf, ff = np.empty(0), np.empty(0)
+for i,dsn in enumerate(dsnames):
+    tc = tcs[i]
+    ds = fit.datasets[dsn]
+    ti, fi = ds.unpack()
+    idx = (ti < -t14/2.) | (ti > t14/2.)
+    res = sm.RLM(fi[idx], sm.add_constant(ti[idx])).fit()
+    model = res.params[0] + res.params[1] * ti
+    fi = fi - model + 1
+    tf = np.append(tf, ti-tc)
+    ff = np.append(ff, fi)
+idx = np.argsort(tf)
+tf = tf[idx]
+ff = ff[idx]
+ff = sigma_clip(ff, sigma_lower=10, sigma_upper=2)
+tf, ff = tf[~ff.mask], ff[~ff.mask]
+# per, _, t0, _ = simfit.util.fit_linear_ephem(*simfit.util.get_ephem(vals_median, epochs))
+# t, f = star.time, star.flux
+# idx = np.isfinite(t) & np.isfinite(f)
+# t, f = t[idx], f[idx]
+# t += K2_TIME_OFFSET
+# tf, ff = simfit.util.fold(t, f, per, t0, width=0.8, clip=True, bl=True, t14=t14)
+with sb.axes_style('white'):
+    fig, ax = pl.subplots(1, 1, figsize=(12,5))
+    ax.plot(tf, ff, marker='o', color='k', lw=0)
+    ax.set_xlabel('Time from mid-transit [days]')
+    ax.set_ylabel('Normalized flux')
+    fig.tight_layout()
+    pl.setp(ax, xlim=[tf.min(), tf.max()])
+    fig.savefig(os.path.join(outdir, 'folded.png'))
+    pl.close()
+fp = os.path.join(outdir, 'folded.csv')
+sig = np.median(fc[:,fit.param_names.index('sig')])
+df = pd.DataFrame(dict(t=tf, f=ff, s=sig))
+df[['t','f','s']].to_csv(fp, index=False, header=False)
+
+
+# CHI-SQUARE AND BETA ANALYSIS
+
+if not args.k2only:
+
+    chisqs, scalefacs = [], []
+    for epoch in spz_epochs:
+        dsname = 'spz-e{}'.format(epoch)
+        chisq = simfit.util.spz_chi2(opt, fit, dsname)
+        chisqs.append(chisq)
+        print "\nepoch {} reduced chi-square: {}".format(epoch, chisq)
+        obj = lambda x: (1 - simfit.util.spz_chi2(opt, fit, dsname, scalefac=x)) ** 2
+        res = op.minimize(obj, 1, method='nelder-mead')
+        chisq = simfit.util.spz_chi2(opt, fit, dsname, scalefac=res.x)
+        print "after applying scale factor {}: {}".format(res.x, chisq)
+        scalefacs.append(res.x[0])
+
+    fp = os.path.join(outdir, 'chisq.txt')
+    with open(fp, 'w') as w:
+        for i,(cs,sf) in enumerate(zip(chisqs, scalefacs)):
+            epoch = spz_epochs[i]
+            w.write("epoch {} chi-square: {}\nscale factor: {}\n".format(epoch, cs, sf))
+
+    betas = []
+    for epoch in spz_epochs:
+        dsname = 'spz-e{}'.format(epoch)
+        ds = fit.datasets[dsname]
+        d = fit._d(opt, dsname)
+        t, f = ds['t'], ds['f']
+        m = fit.lnlikes[dsname](d, *ds.unpack(), get_model=True, full=True)
+        residuals = f - m
+        timescale = np.diff(t).mean() * 24 * 3600
+        beta = simfit.util.beta(residuals, timescale)
+        print "epoch {} beta: {}".format(epoch, beta)
+        betas.append(beta)
+
+    fp = os.path.join(outdir, 'beta.txt')
+    with open(fp, 'w') as w:
+        for i,beta in enumerate(betas):
+            epoch = spz_epochs[i]
+            w.write("epoch {} beta: {}\n".format(epoch, beta))
+
+
+# PLOT SPITZER RESULTS
+
+if not args.k2only:
+
+    for epoch in spz_epochs:
+        fp = os.path.join(outdir, 'spz-e{}-old.png'.format(epoch))
+        simfit.plot.spz_old(fit, opt, 'spz-e{}'.format(epoch), save=fp)
+
+    for epoch in spz_epochs:
+        pl.figure(figsize=(12,6))
+        fp = os.path.join(outdir, 'spz-e{}-new.png'.format(epoch))
+        simfit.plot.spz_new(fit, opt, 'spz-e{}'.format(epoch), save=fp)
+
+    # bs = args.binsize
+    dsn = 'spz-e{}'.format(spz_epochs[0])
+    exptime = np.median(np.diff(fit.datasets[dsn]['t'])) * 24 * 3600
+    assert args.binsize > exptime
+    bs = int(args.binsize / exptime)
+    for i,epoch in enumerate(spz_epochs):
+        fp = os.path.join(outdir, 'spz-final-e{}.png'.format(epoch))
+        simfit.plot.spz(fit, epoch, fc, opt,
+            plot_best=True, save=fp, bs=bs, scale=scalefacs[i])

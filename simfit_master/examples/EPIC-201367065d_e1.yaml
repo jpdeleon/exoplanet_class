@@ -1,0 +1,21 @@
+transit:
+  a: 78.7402
+  i: 1.5652
+  k: 0.0235
+  p: 44.5609
+  t0: 2456826.2285
+  t14: 0.17
+  u: [0.04095, 0.1672]
+stellar:
+  rstar: [0.561, 0.068]
+  teff: [3900, 200]
+  logg: [4.5, 0.5]
+  feh:  [-0.32, 0.13]
+config:
+  star: EPIC-201367065
+  planet: d
+  epoch: 1
+  data_dir: sxphot_out/pickles
+  aor: r53522432
+  geom: '3x3'
+  radius: 3.0
